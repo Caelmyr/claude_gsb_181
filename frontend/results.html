@@ -25,6 +25,32 @@
       <div class="card"><h2>结果分区 <span class="sub">Partitions</span></h2><div id="partitions"></div></div>
       <div class="card"><h2>结果预览 <span class="sub">Preview</span></h2><div id="preview"></div></div>
     </div>
+
+    <div class="card mt compare-card">
+      <div class="flex between compare-head">
+        <div>
+          <h2>作业结果并排对比 <span class="sub">Side-by-side diff</span></h2>
+          <p class="page-desc compact">按记录标识对齐；忽略分区数、规模和输出顺序，重复标识按多集合匹配。</p>
+        </div>
+        <button class="btn primary small" id="compare-run">对比 Compare</button>
+      </div>
+      <div class="compare-pickers">
+        <label>作业 A / Left<div id="compare-left-picker"></div></label>
+        <label>作业 B / Right<div id="compare-right-picker"></div></label>
+        <label>标识字段 Key field<input id="compare-key-field" type="text" value="key"></label>
+        <label>数值容差 Tolerance<input id="compare-tolerance" type="number" min="0" step="0.0001" value="0"></label>
+      </div>
+      <div class="compare-filters">
+        <input id="compare-q" class="input" type="search" placeholder="搜索记录标识 Search key…">
+        <label><input type="checkbox" value="changed" checked> 数值不同</label>
+        <label><input type="checkbox" value="left_only" checked> 仅 A 有</label>
+        <label><input type="checkbox" value="right_only" checked> 仅 B 有</label>
+        <label><input type="checkbox" value="duplicate" checked> 标识重复</label>
+      </div>
+      <div id="compare-stats" class="stat-tiles compact"></div>
+      <div id="compare-results" class="mt"></div>
+      <div id="compare-pager" class="pager"></div>
+    </div>
   </main>
   <script src="js/api.js"></script>
   <script src="js/components.js"></script>

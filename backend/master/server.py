@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import os
 from typing import Optional
 
@@ -25,6 +26,12 @@ from backend.master.fault_tolerance import FaultTolerance
 from backend.master.job_manager import JobManager
 from backend.master.metrics import Metrics
 from backend.master.registry import WorkerRegistry
+from backend.master.result_compare import (
+    DUPLICATE,
+    compare_result_records,
+    load_result_records,
+    page_comparison,
+)
 from backend.master.scheduler import Scheduler
 from backend.master.shuffle import ShuffleCoordinator
 from backend.tasks.registry import list_all as list_functions
@@ -89,6 +96,7 @@ class Master:
         app.add_url_rule("/api/jobs/<job_id>/results", "job_results", self._job_results, methods=["GET"])
         app.add_url_rule("/api/jobs/<job_id>/results/download", "job_results_download",
                          self._job_results_download, methods=["GET"])
+        app.add_url_rule("/api/results/compare", "results_compare", self._results_compare, methods=["GET"])
         app.add_url_rule("/api/workers", "workers", self._workers, methods=["GET"])
         app.add_url_rule("/api/workers/<worker_id>/metrics", "worker_metrics", self._worker_metrics, methods=["GET"])
         app.add_url_rule("/api/cluster/metrics", "cluster_metrics", self._cluster_metrics, methods=["GET"])
@@ -125,14 +133,7 @@ class Master:
         return job, None, None
 
     def _read_results(self, job: Job) -> list[dict]:
-        records: list[dict] = []
-        root = self.storage.path("jobs", job.job_id, "results", C.STAGE_REDUCE)
-        for path in list_files(root, suffix=".json"):
-            doc = read_json(path)
-            if doc:
-                for rec in doc.get("records", []):
-                    records.append(rec)
-        return records
+        return [item.record for item in load_result_records(self.storage, job.job_id)]
 
     def _result_partitions(self, job: Job) -> list[dict]:
         out: list[dict] = []
@@ -148,6 +149,34 @@ class Master:
                 })
         out.sort(key=lambda d: d.get("partition", 0))
         return out
+
+    def _comparison_job_view(self, job: Job) -> dict:
+        return {
+            "job_id": job.job_id,
+            "name": job.name,
+            "status": job.status,
+            "mapper": job.mapper,
+            "reducer": job.reducer,
+            "num_reduce_tasks": job.num_reduce_tasks,
+        }
+
+    def _int_param(self, name: str, default: int, minimum: int, maximum: int) -> int:
+        raw = request.args.get(name, str(default))
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be an integer")
+        return min(maximum, max(minimum, value))
+
+    def _float_param(self, name: str, default: float, minimum: float, maximum: float) -> float:
+        raw = request.args.get(name, str(default))
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            raise ValueError(f"{name} must be a number")
+        if value != value or value < minimum or value > maximum:
+            raise ValueError(f"{name} must be between {minimum} and {maximum}")
+        return value
 
     # ------------------------------------------------------------------
     # Browser-facing routes
@@ -284,9 +313,13 @@ class Master:
         fmt = request.args.get("format", "json").lower()
         if fmt == "csv":
             return self._as_csv(job, records)
-        body = {"job_id": job_id, "job_name": job.name, "records": records, "count": len(records)}
+        body = json.dumps(
+            {"job_id": job_id, "job_name": job.name, "records": records, "count": len(records)},
+            ensure_ascii=False,
+            indent=2,
+        )
         return Response(
-            io.StringIO(__import__("json").dumps(body, ensure_ascii=False, indent=2)).getvalue(),
+            body,
             mimetype="application/json",
             headers={"Content-Disposition": f"attachment; filename={job_id}.json"},
         )
@@ -307,6 +340,69 @@ class Master:
             mimetype="text/csv",
             headers={"Content-Disposition": f"attachment; filename={job.job_id}.csv"},
         )
+
+    def _results_compare(self):
+        left_id = request.args.get("left_job_id", "").strip()
+        right_id = request.args.get("right_job_id", "").strip()
+        if not left_id or not right_id:
+            return jsonify({"error": "left_job_id and right_job_id are required"}), 400
+        if left_id == right_id:
+            return jsonify({"error": "select two different jobs"}), 400
+
+        jobs = []
+        for job_id in (left_id, right_id):
+            job = self.job_manager.get_job(job_id)
+            if job is None:
+                return jsonify({"error": f"unknown job {job_id}"}), 404
+            if job.status != C.JOB_SUCCEEDED:
+                return jsonify({"error": f"job {job_id} is not succeeded"}), 409
+            jobs.append(job)
+
+        key_field = request.args.get("key_field", "key").strip() or "key"
+        allowed_statuses = {"changed", "left_only", "right_only", DUPLICATE}
+        raw_statuses = request.args.getlist("status")
+        statuses: list[str] = []
+        for raw in raw_statuses:
+            for part in raw.split(","):
+                status = part.strip()
+                if status and status not in allowed_statuses:
+                    return jsonify({"error": f"unsupported status filter {status}"}), 400
+                if status:
+                    statuses.append(status)
+
+        try:
+            page = self._int_param("page", 1, 1, 1_000_000)
+            page_size = self._int_param("page_size", 200, 1, 1000)
+            tolerance = self._float_param("numeric_tolerance", 0.0, 0.0, 1.0e9)
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        try:
+            comparison = compare_result_records(
+                load_result_records(self.storage, jobs[0].job_id),
+                load_result_records(self.storage, jobs[1].job_id),
+                key_field=key_field,
+                numeric_tolerance=tolerance,
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        result_page = page_comparison(
+            comparison,
+            query=request.args.get("q", ""),
+            statuses=statuses if raw_statuses else None,
+            page=page,
+            page_size=page_size,
+        )
+        return jsonify({
+            "left": self._comparison_job_view(jobs[0]),
+            "right": self._comparison_job_view(jobs[1]),
+            "key_field": comparison["key_field"],
+            "numeric_tolerance": comparison["numeric_tolerance"],
+            "summary": comparison["summary"],
+            "groups": result_page["items"],
+            "pagination": result_page["pagination"],
+        })
 
     def _workers(self):
         return jsonify(self.registry.summary())
