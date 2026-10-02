@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>结果对比 Compare — 分布式 MapReduce</title>
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <header id="app-nav"></header>
+  <main class="page">
+    <h1 class="page-title">结果对比 <span>Compare Results</span></h1>
+    <p class="page-desc">选择两个作业，按记录键对齐后比较结果差异（与分区数、记录顺序无关）。Select two jobs and diff their results, aligned by record key regardless of partitions or order.</p>
+
+    <div class="flex between mb wrap">
+      <div class="flex wrap">
+        <span class="compare-side">作业 A</span><div id="picker-a"></div>
+        <button class="btn small" id="swap" title="交换 A/B Swap">⇄</button>
+        <span class="compare-side">作业 B</span><div id="picker-b"></div>
+      </div>
+      <div class="flex wrap">
+        <label class="small muted" for="tolerance">容差 Tolerance</label>
+        <input class="num-input" id="tolerance" type="number" min="0" step="any" value="0" title="数值字段的相对/绝对容差 Numeric tolerance">
+        <button class="btn primary small" id="run">对比 Compare</button>
+        <a class="btn small" id="dl" href="#">导出差异 JSON</a>
+      </div>
+    </div>
+
+    <div id="warnings"></div>
+    <div class="stat-tiles" id="stats"></div>
+
+    <div class="card mt">
+      <div class="flex between mb wrap">
+        <div class="pill-group" id="type-filter"></div>
+        <input class="search-input" id="key-search" type="search" placeholder="搜索键定位差异 Search key…">
+      </div>
+      <div id="diffs"></div>
+      <div class="flex between mt" id="pager"></div>
+    </div>
+  </main>
+  <script src="js/api.js"></script>
+  <script src="js/components.js"></script>
+  <script src="js/pages/compare.js"></script>
+</body>
+</html>

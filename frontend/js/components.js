@@ -12,6 +12,7 @@ const Components = (() => {
     { key: 'fault', href: 'fault.html', label: '故障恢复 Fault' },
     { key: 'config', href: 'config.html', label: '配置管理 Config' },
     { key: 'results', href: 'results.html', label: '结果导出 Results' },
+    { key: 'compare', href: 'compare.html', label: '结果对比 Compare' },
   ];
 
   const LABELS = {
@@ -89,6 +90,7 @@ const Components = (() => {
   }
 
   // headers: [{key, label, num, render(row), width}]
+  // opts: {onClick(row), rowClass(row) -> css class for the <tr>}
   function table(headers, rows, opts) {
     if (!rows || !rows.length) return empty();
     const thead = '<tr>' + headers.map(h =>
@@ -100,7 +102,8 @@ const Components = (() => {
         return `<td class="${h.num ? 'num tabular' : ''}">${val == null ? '-' : val}</td>`;
       }).join('');
       const click = (opts && opts.onClick) ? ` data-row="${ri}"` : '';
-      return `<tr${click}>${tds}</tr>`;
+      const rcls = (opts && opts.rowClass) ? opts.rowClass(row, ri) : '';
+      return `<tr${rcls ? ` class="${rcls}"` : ''}${click}>${tds}</tr>`;
     }).join('');
     const html = `<div class="table-wrap"><table class="table"><thead>${thead}</thead><tbody>${tbody}</tbody></table></div>`;
     if (opts && opts.onClick) {

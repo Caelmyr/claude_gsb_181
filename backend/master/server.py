@@ -25,6 +25,9 @@ from backend.master.fault_tolerance import FaultTolerance
 from backend.master.job_manager import JobManager
 from backend.master.metrics import Metrics
 from backend.master.registry import WorkerRegistry
+from backend.master.result_compare import (
+    DIFF_TYPES, compare_jobs, filter_diffs, read_job_results,
+)
 from backend.master.scheduler import Scheduler
 from backend.master.shuffle import ShuffleCoordinator
 from backend.tasks.registry import list_all as list_functions
@@ -89,6 +92,9 @@ class Master:
         app.add_url_rule("/api/jobs/<job_id>/results", "job_results", self._job_results, methods=["GET"])
         app.add_url_rule("/api/jobs/<job_id>/results/download", "job_results_download",
                          self._job_results_download, methods=["GET"])
+        app.add_url_rule("/api/compare", "compare", self._compare, methods=["GET"])
+        app.add_url_rule("/api/compare/download", "compare_download",
+                         self._compare_download, methods=["GET"])
         app.add_url_rule("/api/workers", "workers", self._workers, methods=["GET"])
         app.add_url_rule("/api/workers/<worker_id>/metrics", "worker_metrics", self._worker_metrics, methods=["GET"])
         app.add_url_rule("/api/cluster/metrics", "cluster_metrics", self._cluster_metrics, methods=["GET"])
@@ -125,14 +131,7 @@ class Master:
         return job, None, None
 
     def _read_results(self, job: Job) -> list[dict]:
-        records: list[dict] = []
-        root = self.storage.path("jobs", job.job_id, "results", C.STAGE_REDUCE)
-        for path in list_files(root, suffix=".json"):
-            doc = read_json(path)
-            if doc:
-                for rec in doc.get("records", []):
-                    records.append(rec)
-        return records
+        return read_job_results(self.storage, job.job_id)
 
     def _result_partitions(self, job: Job) -> list[dict]:
         out: list[dict] = []
@@ -306,6 +305,114 @@ class Master:
             buf.getvalue(),
             mimetype="text/csv",
             headers={"Content-Disposition": f"attachment; filename={job.job_id}.csv"},
+        )
+
+    # ------------------------------------------------------------------
+    # Cross-job result comparison
+    # ------------------------------------------------------------------
+    def _compare_context(self):
+        """Validate the ``a``/``b`` query params and compute the comparison."""
+        a_id = request.args.get("a", "").strip()
+        b_id = request.args.get("b", "").strip()
+        if not a_id or not b_id:
+            return None, (jsonify({
+                "error": "需要两个作业参数 Provide both ?a= and ?b= job ids",
+            }), 400)
+        job_a = self.job_manager.get_job(a_id)
+        job_b = self.job_manager.get_job(b_id)
+        if job_a is None:
+            return None, (jsonify({"error": f"unknown job {a_id}"}), 404)
+        if job_b is None:
+            return None, (jsonify({"error": f"unknown job {b_id}"}), 404)
+        try:
+            tolerance = float(request.args.get("tolerance", 0) or 0)
+        except (TypeError, ValueError):
+            return None, (jsonify({"error": "tolerance must be a number"}), 400)
+        report = compare_jobs(self.storage, a_id, b_id, tolerance=tolerance)
+        return (job_a, job_b, tolerance, report), None
+
+    @staticmethod
+    def _compare_side(job: Job, stats: dict) -> dict:
+        return {
+            "job_id": job.job_id,
+            "name": job.name,
+            "status": job.status,
+            "status_label": C.state_label(job.status),
+            "mapper": job.mapper,
+            "reducer": job.reducer,
+            "finished_ms": job.finished_ms,
+            "records": stats["records"],
+            "keys": stats["keys"],
+            "duplicate_keys": stats["duplicate_keys"],
+        }
+
+    @staticmethod
+    def _compare_warnings(job_a: Job, job_b: Job, report: dict) -> list[str]:
+        warnings: list[str] = []
+        for label, job in (("a", job_a), ("b", job_b)):
+            if job.status != C.JOB_SUCCEEDED:
+                warnings.append(
+                    f"作业 {label.upper()} 尚未成功完成（{C.state_label(job.status)}），结果可能不完整 "
+                    f"Job {label.upper()} is {job.status}; its results may be partial"
+                )
+            elif report[label]["records"] == 0:
+                warnings.append(
+                    f"作业 {label.upper()} 没有结果记录 "
+                    f"Job {label.upper()} produced no result records"
+                )
+        return warnings
+
+    @staticmethod
+    def _int_arg(name: str, default: int, lo: int, hi: int) -> int:
+        try:
+            value = int(request.args.get(name, default) or default)
+        except (TypeError, ValueError):
+            value = default
+        return max(lo, min(hi, value))
+
+    def _compare(self):
+        ctx, err = self._compare_context()
+        if err:
+            return err
+        job_a, job_b, tolerance, report = ctx
+        diff_type = request.args.get("type", "")
+        if diff_type not in DIFF_TYPES:
+            diff_type = ""
+        query = request.args.get("q", "")
+        offset = self._int_arg("offset", 0, 0, 10 ** 9)
+        limit = self._int_arg("limit", 200, 1, 5000)
+        filtered = filter_diffs(report["diffs"], diff_type, query)
+        page = filtered[offset:offset + limit]
+        return jsonify({
+            "a": self._compare_side(job_a, report["a"]),
+            "b": self._compare_side(job_b, report["b"]),
+            "tolerance": tolerance,
+            "warnings": self._compare_warnings(job_a, job_b, report),
+            "summary": report["summary"],
+            "diffs": page,
+            "diffs_total": len(filtered),
+            "offset": offset,
+            "limit": limit,
+            "truncated": offset + len(page) < len(filtered),
+        })
+
+    def _compare_download(self):
+        ctx, err = self._compare_context()
+        if err:
+            return err
+        job_a, job_b, tolerance, report = ctx
+        body = {
+            "a": self._compare_side(job_a, report["a"]),
+            "b": self._compare_side(job_b, report["b"]),
+            "tolerance": tolerance,
+            "summary": report["summary"],
+            "diffs": report["diffs"],
+        }
+        return Response(
+            __import__("json").dumps(body, ensure_ascii=False, indent=2),
+            mimetype="application/json",
+            headers={"Content-Disposition":
+                     f"attachment; filename=compare-{job_a.job_id}-{job_b.job_id}.json"},
         )
 
     def _workers(self):
